@@ -30,18 +30,18 @@ from pupil_labs.realtime_api.simple import Device
 HOST = "0.0.0.0"
 PORT = 8765
 
-PUPIL_DEVICE_IP = "192.168.137.249"   # <-- set this if needed
+PUPIL_DEVICE_IP = "192.168.137.249"   # IP adress of the Pupil Companion app
 PUPIL_DEVICE_PORT = 8080
 
-OFFSET_REFRESH_SEC = 10.0
+OFFSET_REFRESH_SEC = 10.0   #time in seconds between re-sync of the clocks
 
 device = None
-device_lock = threading.Lock()
+device_lock = threading.Lock()  
 
 offset_lock = threading.Lock()
-host_minus_companion_ns = 0
-offset_std_ms = None
-offset_last_updated_ns = 0
+host_minus_companion_ns = 0    #clock difference in nanoseconds between the laptop and the Pupil device
+offset_std_ms = None           # standard deviation (how uncertain the offset estimate is)
+offset_last_updated_ns = 0     #time in which the last offset was calculated
 
 
 # ──────────────────────────────────────────────
@@ -53,7 +53,7 @@ def connect_device():
         device = Device(address=PUPIL_DEVICE_IP, port=PUPIL_DEVICE_PORT)
         print(f"Connected to Pupil device at {PUPIL_DEVICE_IP}:{PUPIL_DEVICE_PORT}")
     except Exception as e:
-        sys.exit(f"Could not connect to Pupil device: {e}")
+        sys.exit(f"Could not connect to Pupil device: {e}")  #quits immediatly if it can´t connect
 
 
 def refresh_offset():
@@ -61,20 +61,20 @@ def refresh_offset():
 
     try:
         with device_lock:
-            estimate = device.estimate_time_offset()
+            estimate = device.estimate_time_offset()    #ask Pupil device for the clock difference
 
         if estimate is None:
             print("[warn] No time-offset estimate returned.")
             return
 
-        # host_minus_companion_ns: add to companion time -> host time
+        # converts from milliseconds to nanoseconds for precision
         mean_ms = float(estimate.time_offset_ms.mean)
         std_ms = float(estimate.time_offset_ms.std)
 
         with offset_lock:
             host_minus_companion_ns = int(mean_ms * 1_000_000)
             offset_std_ms = std_ms
-            offset_last_updated_ns = time.time_ns()
+            offset_last_updated_ns = time.time_ns() #record when we last updated
 
         print(
             f"[offset] host-companion = {mean_ms:.2f} ms "
@@ -86,6 +86,7 @@ def refresh_offset():
 
 
 def offset_loop():
+    #always runs in the background, refreshing the clock offset every 10 seconds
     while True:
         refresh_offset()
         time.sleep(OFFSET_REFRESH_SEC)
@@ -96,9 +97,10 @@ def offset_loop():
 # ──────────────────────────────────────────────
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):
-        return
+        return  #silence the default request logging
 
     def _send_json(self, obj, code=200):
+        #helper : convert a Python dict to JSON and send it as the HTTP response
         data = json.dumps(obj).encode("utf-8")
         self.send_response(code)
         self.send_header("Content-Type", "application/json")
@@ -107,6 +109,7 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(data)
 
     def _read_json(self):
+        # helper: read the JSON body from an incoming POST request
         n = int(self.headers.get("Content-Length", "0"))
         raw = self.rfile.read(n) if n > 0 else b"{}"
         return json.loads(raw.decode("utf-8"))
@@ -115,12 +118,13 @@ class Handler(BaseHTTPRequestHandler):
         path = urlparse(self.path).path
 
         if path == "/sync":
-            t_recv = time.time_ns()
+            #unity calls this to get the clock offset and the server timestamps
+            t_recv = time.time_ns() #record when the request arrived
             with offset_lock:
                 hmcn = host_minus_companion_ns
                 std = offset_std_ms
                 upd = offset_last_updated_ns
-            t_send = time.time_ns()
+            t_send = time.time_ns()  #record when we're about to reply
 
             self._send_json({
                 "ok": True,
@@ -133,6 +137,7 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         if path == "/status":
+            #Unity calls this to check the brigde is running and see the lastest offset
             with offset_lock:
                 self._send_json({
                     "ok": True,
@@ -150,10 +155,11 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/event":
             try:
                 body = self._read_json()
-                name = str(body["name"])
-                ts_ns = int(body["companion_timestamp_ns"])
+                name = str(body["name"]) # event label
+                ts_ns = int(body["companion_timestamp_ns"]) # timestamp already in Pupil time
 
                 with device_lock:
+                    # send the event to the Pupil device so it gets recorded in the eye-tracking data
                     event = device.send_event(name, event_timestamp_unix_ns=ts_ns)
 
                 print(f"[event] {name[:120]}")
@@ -174,16 +180,16 @@ class Handler(BaseHTTPRequestHandler):
 # Main
 # ──────────────────────────────────────────────
 def main():
-    connect_device()
-    refresh_offset()
-    threading.Thread(target=offset_loop, daemon=True).start()
+    connect_device() # connect to Pupil Companion
+    refresh_offset() # immediately get the first clock offset 
+    threading.Thread(target=offset_loop, daemon=True).start() # keep refreshing in background
 
-    server = ThreadingHTTPServer((HOST, PORT), Handler)
+    server = ThreadingHTTPServer((HOST, PORT), Handler) # create the HTTP server
     print(f"Bridge running on http://{HOST}:{PORT}")
     print("Press Ctrl+C to stop.\n")
 
     try:
-        server.serve_forever()
+        server.serve_forever()  # start handling requests from Unity
     except KeyboardInterrupt:
         print("\nStopping bridge...")
     finally:
@@ -191,7 +197,7 @@ def main():
         if device is not None:
             with device_lock:
                 try:
-                    device.close()
+                    device.close() #disconnect from the Pupil device on exit
                 except Exception:
                     pass
 
