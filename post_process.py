@@ -27,11 +27,13 @@ import pandas as pd
 # Helpers
 # ──────────────────────────────────────────────
 def find_one(folder: Path, pattern: str):
+    # search for files matching a pattern and return the first one found
     matches = sorted(folder.glob(pattern))
     return matches[0] if matches else None
 
 
 def parse_event_name(name: str):
+    #splits event names into a dictionary for easier use
     parts = str(name).split(";")
     out = {"event_type": parts[0] if parts else ""}
     for p in parts[1:]:
@@ -42,6 +44,7 @@ def parse_event_name(name: str):
 
 
 def load_trials(unity_folder: Path):
+    # finds and loads the trials CSV that Unity saved during the session
     trials_file = find_one(unity_folder, "*_trials.csv")
     if trials_file is None:
         raise FileNotFoundError(f"No *_trials.csv found in {unity_folder}")
@@ -50,12 +53,14 @@ def load_trials(unity_folder: Path):
 
 
 def load_pupil_events(pupil_folder: Path):
+    # load the events.csv exported from the Pupil recording
     events_file = pupil_folder / "events.csv"
     if not events_file.exists():
         raise FileNotFoundError(f"Missing {events_file}")
 
     events = pd.read_csv(events_file)
-
+    
+    # make sure the file has all the columns we need
     required = {"recording id", "timestamp [ns]", "name", "type"}
     missing = required - set(events.columns)
     if missing:
@@ -64,7 +69,7 @@ def load_pupil_events(pupil_folder: Path):
     parsed = events["name"].apply(parse_event_name).apply(pd.Series)
     events = pd.concat([events, parsed], axis=1)
 
-    # Keep only rows that look like your injected game events
+    # keep only rows that are actual game events (not Pupil events)
     game_events = events[events["event_type"].notna()].copy()
     game_events = game_events[
         game_events["event_type"].astype(str).str.len() > 0
@@ -81,8 +86,10 @@ def load_pupil_events(pupil_folder: Path):
 
 
 def label_gaze(gaze_file: Path, game_events: pd.DataFrame):
+    # load gaze data and tag each gaze sample with whatever game event was active at that moment
     gaze = pd.read_csv(gaze_file)
-
+    
+     # handle different timestamp column names depending on the Pupil export version
     if "timestamp [ns]" in gaze.columns:
         gaze_ts = gaze["timestamp [ns]"].astype("int64")
     elif "timestamp" in gaze.columns:
@@ -100,15 +107,16 @@ def label_gaze(gaze_file: Path, game_events: pd.DataFrame):
     current_idx = []
 
     j = -1
+    # walk forward through events until we find the most recent one before this gaze sample
     for ts in gaze_ts:
         while (j + 1) < len(event_times) and event_times[j + 1] <= ts:
             j += 1
 
         if j >= 0:
-            current_labels.append(event_labels[j])
+            current_labels.append(event_labels[j])  # tag gaze with the active event
             current_idx.append(j)
         else:
-            current_labels.append("pre_session")
+            current_labels.append("pre_session") # gaze recorded before any game event
             current_idx.append(-1)
 
     gaze["current_game_event"] = current_labels
@@ -117,6 +125,7 @@ def label_gaze(gaze_file: Path, game_events: pd.DataFrame):
 
 
 def annotate_video(video_file: Path, output_file: Path, game_events: pd.DataFrame):
+    # open the eye-tracker world camera video and write a new copy with event labels in
     cap = cv2.VideoCapture(str(video_file))
     if not cap.isOpened():
         raise RuntimeError(f"Could not open video: {video_file}")
@@ -135,7 +144,8 @@ def annotate_video(video_file: Path, output_file: Path, game_events: pd.DataFram
     # Use the first event timestamp as reference start
     if len(game_events) == 0:
         raise RuntimeError("No game events found in Pupil events.csv.")
-
+        
+     # use the first event timestamp as our time reference point
     first_ts = int(game_events.iloc[0]["timestamp [ns]"])
     event_times = game_events["timestamp [ns]"].astype("int64").tolist()
     event_labels = game_events["event_type"].astype(str).tolist()
@@ -146,21 +156,25 @@ def annotate_video(video_file: Path, output_file: Path, game_events: pd.DataFram
     while True:
         ok, frame = cap.read()
         if not ok:
-            break
-
+            break # end of video
+            
+        # estimate the timestamp of this frame based on its position in the video
         frame_ts = first_ts + int((frame_idx / fps) * 1e9)
 
+        # advance to the most recent event that has passed by this frame
         while (current_event_i + 1) < len(event_times) and event_times[current_event_i + 1] <= frame_ts:
             current_event_i += 1
 
         current_label = event_labels[current_event_i]
         current_event_ts = event_times[current_event_i]
-        delta_ms = (frame_ts - current_event_ts) / 1e6
+        delta_ms = (frame_ts - current_event_ts) / 1e6  # how long since this event started
 
+        # build the three lines of text to overlay on the frame
         overlay1 = f"Event: {current_label}"
         overlay2 = f"t since event: {delta_ms:8.1f} ms"
         overlay3 = f"frame {frame_idx+1}/{frame_count}"
-
+        
+        # draw a black box behind the text so it's readable on any background
         cv2.rectangle(frame, (20, 20), (720, 130), (0, 0, 0), -1)
         cv2.putText(frame, overlay1, (35, 55), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 255, 255), 2, cv2.LINE_AA)
         cv2.putText(frame, overlay2, (35, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (200, 200, 200), 2, cv2.LINE_AA)
@@ -192,21 +206,26 @@ def main():
 
     print(f"Session: {session_dir}")
 
+    # load Unity trial data
     trials_file, trials = load_trials(unity_dir)
     print(f"Trials: {trials_file.name} ({len(trials)} rows)")
 
+    # load and parse Pupil events
     events_file, raw_events, game_events = load_pupil_events(pupil_dir)
     print(f"Pupil events: {events_file.name} ({len(raw_events)} rows total)")
     print(f"Game events parsed: {len(game_events)} rows")
 
+    # save the cleaned game events to derived/
     out_events = derived_dir / "game_events_from_pupil.csv"
     game_events.to_csv(out_events, index=False)
     print(f"Saved: {out_events}")
 
+    # save a copy of the trials data to derived/
     out_trials = derived_dir / "game_trials_copy.csv"
     trials.to_csv(out_trials, index=False, sep=";")
     print(f"Saved: {out_trials}")
-
+    
+    # label gaze data with active game events
     gaze_file = pupil_dir / "gaze.csv"
     if gaze_file.exists():
         gaze_labeled = label_gaze(gaze_file, game_events)
@@ -216,6 +235,7 @@ def main():
     else:
         print("No gaze.csv found — skipping gaze labeling.")
 
+    # annotate the world camera video with event labels
     video_file = pupil_dir / "world.mp4"
     if video_file.exists():
         out_video = derived_dir / "world_annotated.mp4"
