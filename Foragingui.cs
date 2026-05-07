@@ -19,6 +19,7 @@ using System.Collections;
 ///  ┌─────────────────────────────────────────┐
 ///  │        [TIMER  —  top centre]           │
 ///  │  [LEVEL — top left]  [GOLD — top right] │
+///  │            [progress bar]               │
 ///  │          [MESSAGE — centre]             │
 ///  │       [REWARD BURST — centre]           │
 ///  └─────────────────────────────────────────┘
@@ -37,16 +38,31 @@ public class ForagingUI : MonoBehaviour
     private GameObject rewardPanel;
     private RectTransform rewardRect;
 
+    private GameObject timerPanel;
+    private GameObject levelPanel;
+    private GameObject goldPanel;
+
+    public bool isPracticeMode = false;
+
+    // ─── Gold Progress Bar ────────────────────────
+    private Image      goldBarFill;
+    private GameObject goldBarPanel;
+
+    [Header("Gold Progress Bar")]
+    [Tooltip("Total gold target displayed in the progress bar. Set to match your session's expected gold ceiling.")]
+    public float goldTargetAmount = 500f;
+
     // ─────────────────────────────────────────
     //  Style
     // ─────────────────────────────────────────
     private static readonly Color BgColor      = new Color(0f,    0f,    0f,    0.55f);
-    private static readonly Color RewardBg     = new Color(0.9f,  0.65f, 0f,    0.92f);
+    // Change these lines in the Style section
+    private static readonly Color GoldColor = new Color(0.85f, 0.75f, 0.85f, 1f); // Approx D8BFD8
+    private static readonly Color RewardBg  = new Color(0.85f, 0.75f, 0.85f, 0.92f);
     private static readonly Color TextColor    = new Color(0.95f, 0.95f, 0.95f, 1f);
-    private static readonly Color GoldColor    = new Color(1f,    0.85f, 0.1f,  1f);
     private static readonly Color TimerColor   = new Color(1f,    1f,    1f,    1f);
     private static readonly Color TimerUrgent  = new Color(1f,    0.3f,  0.2f,  1f);
-    private static readonly Color RewardText   = new Color(1f,    1f,    0.85f, 1f);
+    private static readonly Color RewardText   = new Color(0.55f, 0f, 0.55f, 1f);
 
     // ─────────────────────────────────────────
     //  Unity Lifecycle
@@ -56,13 +72,26 @@ public class ForagingUI : MonoBehaviour
         BuildHUD();
     }
 
+    void Start() {
+    if (isPracticeMode) {
+        // Hide the "Scary" experimental stuff
+        if (timerText != null) timerText.gameObject.SetActive(false);
+        if (levelText != null) levelText.gameObject.SetActive(false);
+        if (goldText != null) goldText.gameObject.SetActive(false);
+        if (goldBarPanel != null) goldBarPanel.SetActive(false);
+        if (timerPanel != null) timerPanel.SetActive(false);
+        if (levelPanel != null) levelPanel.SetActive(false);
+        if (goldPanel != null) goldPanel.SetActive(false);
+
+        }
+    }
     // ─────────────────────────────────────────
     //  HUD Construction
     // ─────────────────────────────────────────
     private void BuildHUD()
     {
         // ── Timer — top centre ───────────────
-        GameObject timerPanel = CreatePanel("TimerPanel",
+        timerPanel = CreatePanel("TimerPanel",
             new Vector2(0.5f, 1f), new Vector2(0.5f, 1f),
             new Vector2(0.5f, 1f), new Vector2(0f, -10f),
             new Vector2(220f, 60f));
@@ -70,7 +99,7 @@ public class ForagingUI : MonoBehaviour
             TextAlignmentOptions.Center, TimerColor);
 
         // ── Level — top left ─────────────────
-        GameObject levelPanel = CreatePanel("LevelPanel",
+        levelPanel = CreatePanel("LevelPanel",
             new Vector2(0f, 1f), new Vector2(0f, 1f),
             new Vector2(0f, 1f), new Vector2(10f, -10f),
             new Vector2(180f, 52f));
@@ -78,7 +107,7 @@ public class ForagingUI : MonoBehaviour
             TextAlignmentOptions.Left, GoldColor);
 
         // ── Gold — top right ─────────────────
-        GameObject goldPanel = CreatePanel("GoldPanel",
+        goldPanel = CreatePanel("GoldPanel",
             new Vector2(1f, 1f), new Vector2(1f, 1f),
             new Vector2(1f, 1f), new Vector2(-10f, -10f),
             new Vector2(180f, 52f));
@@ -104,8 +133,77 @@ public class ForagingUI : MonoBehaviour
             TextAlignmentOptions.Center, RewardText);
         rewardRect = rewardPanel.GetComponent<RectTransform>();
         rewardPanel.SetActive(false);
+
+        BuildGoldBar();
+
+        
     }
 
+    public void UpdateResourceLabel(string resourceName = "Gold", float amount = 0f)
+{
+    if (goldText != null)
+        goldText.text = $"{resourceName}: {amount:F0}";
+}
+
+    // ─────────────────────────────────────────
+//  Gold Progress Bar
+// ─────────────────────────────────────────
+private void BuildGoldBar()
+{
+    // 1. Main Panel: Now anchored to TOP (0.5f, 1f) so it stays under the Timer
+    // Lowered it to y: -80 to sit below the Top Centre Timer
+    goldBarPanel = CreatePanel("GoldBarPanel",
+        new Vector2(0.5f, 1f), new Vector2(0.5f, 1f), 
+        new Vector2(0.5f, 1f), new Vector2(0f, -80f), 
+        new Vector2(400f, 60f)); 
+
+    Texture2D tex = new Texture2D(1, 1);
+    tex.SetPixel(0, 0, Color.white);
+    tex.Apply();
+    Sprite pixelSprite = Sprite.Create(tex, new Rect(0, 0, 1, 1), new Vector2(0.5f, 0.5f));
+
+    // 2. Background Track
+    GameObject bgGO = new GameObject("GoldBarBg", typeof(RectTransform), typeof(Image));
+    bgGO.transform.SetParent(goldBarPanel.transform, false);
+    RectTransform bgRT = bgGO.GetComponent<RectTransform>();
+    
+    bgRT.anchorMin = new Vector2(0.5f, 0.5f);
+    bgRT.anchorMax = new Vector2(0.5f, 0.5f);
+    bgRT.pivot = new Vector2(0.5f, 0.5f);
+    bgRT.sizeDelta = new Vector2(380f, 18f); 
+    bgRT.anchoredPosition = new Vector2(0f, -5f); // Centred in panel
+    
+    Image bgImage = bgGO.GetComponent<Image>();
+    bgImage.sprite = pixelSprite;
+    bgImage.color = new Color(1f, 1f, 1f, 0.12f);
+
+    // 3. Yellow Fill
+    GameObject fillGO = new GameObject("GoldBarFill", typeof(RectTransform), typeof(Image));
+    fillGO.transform.SetParent(bgGO.transform, false);
+    RectTransform fillRT = fillGO.GetComponent<RectTransform>();
+    fillRT.anchorMin = Vector2.zero;
+    fillRT.anchorMax = Vector2.one;
+    fillRT.offsetMin = Vector2.zero;
+    fillRT.offsetMax = Vector2.zero;
+
+    goldBarFill = fillGO.GetComponent<Image>();
+    goldBarFill.sprite = pixelSprite;
+    goldBarFill.color = new Color(0.85f, 0.75f, 0.85f, 1f);
+    goldBarFill.type = Image.Type.Filled;
+    goldBarFill.fillMethod = Image.FillMethod.Horizontal;
+    goldBarFill.fillOrigin = (int)Image.OriginHorizontal.Left;
+    goldBarFill.fillAmount = 0f; 
+}
+
+public void UpdateGoldBar(float totalGold)
+{
+    if (goldBarFill == null) return;
+
+    float ratio = goldTargetAmount > 0 ? (totalGold / goldTargetAmount) : 0f;
+    
+    // Hard set the fill amount
+    goldBarFill.fillAmount = Mathf.Clamp01(ratio);
+}
     // ─────────────────────────────────────────
     //  Helpers
     // ─────────────────────────────────────────
@@ -164,10 +262,10 @@ public class ForagingUI : MonoBehaviour
     }
 
     /// <summary>Updates the level label — e.g. "Level 2 / 5"</summary>
-    public void UpdateLevel(int level, int totalLevels)
+    public void UpdateLevel(int level)
     {
         if (levelText != null)
-            levelText.text = $"Level {level} / {totalLevels}";
+            levelText.text = $"Level {level} / 5";
     }
 
     /// <summary>Updates the gold counter</summary>
@@ -217,7 +315,7 @@ public class ForagingUI : MonoBehaviour
         if (rewardCoroutine != null)
             StopCoroutine(rewardCoroutine);
 
-        rewardText.text = $"★  {gainText}  ★\n<size=22><color=#FFD700>Total: {totalGold:F0}</color></size>";
+        rewardText.text = $"{gainText}\n<size=22><color=#8B008B>Total: {totalGold:F0}</color></size>";
         rewardCoroutine = StartCoroutine(RewardBurst());
     }
 

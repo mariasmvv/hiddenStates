@@ -7,6 +7,12 @@ using System.Text;
 
 public class GameManager : MonoBehaviour
 {
+    private static GameManager _instance;
+
+    [Header("Automation")]
+    public bool quitApplicationOnSessionEnd = true;
+    public float quitDelaySeconds = 3f;
+
     [Header("Rocks")]
     public OrbManager rock0;
     public OrbManager rock1;
@@ -15,15 +21,11 @@ public class GameManager : MonoBehaviour
     public TownLevelManager townLevelManager;
     public ForagingUI ui;
 
-    [Header("Optional LSL (legacy)")]
-    public LSLManager lsl;
-
     [Header("Pupil / Sync")]
     public PupilBridgeClient pupil;
     public bool usePupilEvents = true;
 
     [Header("── Laptop Network (EDIT THIS) ──")]
-    [Tooltip("http://<laptop-LAN-IP>:<port>  e.g. http://192.168.1.42:8765")]
     public string laptopUrl = "http://192.168.1.50:8765";
 
     [Header("Session Structure")]
@@ -35,22 +37,22 @@ public class GameManager : MonoBehaviour
     [Range(0f, 1f)] public float rewardProbability = 0.9f;
     [Range(0f, 1f)] public float depletionProbability = 0.3f;
 
-    [Header("Gold (cosmetic incentive)")]
+    [Header("Gold")]
     public float goldPerReward = 10f;
 
     [Header("Participant / Output")]
-    [Tooltip("Set this before pressing Play. Example: P001")]
     public string participantName = "TEST";
-
-    [Tooltip("Optional custom root folder. Leave empty to use Application.persistentDataPath/SessionData")]
     public string outputRootFolder = "";
 
-    [Header("Runtime State (read-only)")]
+    [Header("Runtime State")]
     [SerializeField] private int currentLevel = 1;
     [SerializeField] private float levelTimer = 0f;
     [SerializeField] private bool sessionActive = false;
     [SerializeField] private bool inTransition = false;
-    [SerializeField] private int activeRock = 0;
+
+    [SerializeField] private bool rock0Active = true;
+    [SerializeField] private bool rock1Active = false;
+
     [SerializeField] private int depletionCount = 0;
     [SerializeField] private float totalGold = 0f;
     [SerializeField] private float levelGold = 0f;
@@ -64,6 +66,8 @@ public class GameManager : MonoBehaviour
     private long sessionStartNs = 0L;
     private int trialNumber = 0;
     private string saveTimestamp = "";
+
+    public string[] levelResources = { "Gold", "Water", "Crystals", "Rock", "Wood" };
 
     private readonly List<TrialRecord> trialLog = new List<TrialRecord>();
     private readonly List<EventRecord> eventLog = new List<EventRecord>();
@@ -79,11 +83,14 @@ public class GameManager : MonoBehaviour
         public int rockChosen;
         public bool wasActiveRock;
         public bool rewarded;
-        public bool depletionOccurred;
+        public bool rock0Flipped;
+        public bool rock1Flipped;
+        public bool anyFlipOccurred;
         public float goldGained;
         public float levelGold;
         public float totalGold;
-        public int activeRockAfter;
+        public bool rock0ActiveAfter;
+        public bool rock1ActiveAfter;
         public int depletionCount;
     }
 
@@ -97,53 +104,121 @@ public class GameManager : MonoBehaviour
 
     void Awake()
     {
+        // 1. SINGLETON: Only one GameManager can exist
+        if (_instance != null && _instance != this)
+        {
+            Destroy(gameObject);
+            return;
+        }
+        _instance = this;
+        DontDestroyOnLoad(gameObject); // 2. PERSISTENCE: Stay alive between scenes
+
+        // Auto-find references if missing
         if (ui == null) ui = FindObjectOfType<ForagingUI>();
         if (townLevelManager == null) townLevelManager = FindObjectOfType<TownLevelManager>();
-        if (lsl == null) lsl = FindObjectOfType<LSLManager>();
         if (pupil == null) pupil = FindObjectOfType<PupilBridgeClient>();
 
         if (pupil != null)
             pupil.SetUrl(laptopUrl);
 
-        if (rock0 == null || rock1 == null)
+        FindRocksInScene();
+    }
+
+    private void OnEnable() => UnityEngine.SceneManagement.SceneManager.sceneLoaded += OnSceneLoaded;
+    private void OnDisable() => UnityEngine.SceneManagement.SceneManager.sceneLoaded -= OnSceneLoaded;
+
+private void OnSceneLoaded(UnityEngine.SceneManagement.Scene scene, UnityEngine.SceneManagement.LoadSceneMode mode)
+{
+    // Re-find references for the new scene
+    FindRocksInScene();
+    ui = FindObjectOfType<ForagingUI>();
+
+    // ONLY start the session if we have transitioned to Level1
+    if (scene.name == "Level1" && !sessionActive)
+    {
+        StartSession();
+    }
+
+    ui?.UpdateGold(totalGold);
+    ui?.UpdateLevel(currentLevel);
+    ui?.UpdateResourceLabel(CurrentResourceName, levelGold);
+}
+
+    private void LoadParticipantNameFromDashboard()
+{
+    // 1. Try to use the path assigned in the Inspector
+    string configPath = Path.Combine(outputRootFolder, "next_session_config.txt");
+
+    // 2. If the Inspector field is empty, fallback to the default path
+    if (string.IsNullOrEmpty(outputRootFolder))
+    {
+        // FIX: Added 'string' here so the variable 'root' is properly declared
+        string root = Path.Combine(Application.persistentDataPath, "SessionData");
+        configPath = Path.Combine(root, "next_session_config.txt");
+    }
+
+    if (File.Exists(configPath))
+    {
+        try
         {
-            foreach (var r in FindObjectsOfType<OrbManager>())
+            string name = File.ReadAllText(configPath).Trim();
+            if (!string.IsNullOrEmpty(name))
             {
-                if (r.rockID == 0) rock0 = r;
-                if (r.rockID == 1) rock1 = r;
+                this.participantName = name;
+                Debug.Log($"[GameManager] Participant name updated from dashboard: {name}");
+                
+                // Delete the file so it doesn't reuse the name next time
+                File.Delete(configPath);
             }
         }
+        catch (Exception e)
+        {
+            Debug.LogError($"Failed to read dashboard config: {e.Message}");
+        }
+    }
+}
 
-        if (rock0 == null) Debug.LogError("[GameManager] rock0 not found!");
-        if (rock1 == null) Debug.LogError("[GameManager] rock1 not found!");
+    private void FindRocksInScene()
+    {
+        rock0 = null;
+        rock1 = null;
+        foreach (var r in FindObjectsOfType<OrbManager>())
+        {
+            if (r.rockID == 0) rock0 = r;
+            if (r.rockID == 1) rock1 = r;
+        }
     }
 
     private IEnumerator Start()
     {
         if (pupil != null)
             yield return pupil.Initialize();
-
-        StartSession();
     }
 
     void Update()
-    {
-        if (!sessionActive || inTransition) return;
+{
+    if (!sessionActive || inTransition) return;
 
-        levelTimer += Time.deltaTime;
-        ui?.UpdateTimer(Mathf.Max(0f, levelDuration - levelTimer));
+    levelTimer += Time.deltaTime;
+    ui?.UpdateTimer(Mathf.Max(0f, levelDuration - levelTimer));
 
-        if (levelTimer >= levelDuration)
-            StartCoroutine(TransitionToNextLevel());
-    }
+    if (levelTimer >= levelDuration)
+        StartCoroutine(TransitionToNextLevel());
+}
 
     public void StartSession()
     {
+        // 1. SYNC NAME FIRST: Look for the dashboard file before doing anything else
+        LoadParticipantNameFromDashboard();
+
+        // 2. NOW SET TIMESTAMPS: These will be used for the folder name
         sessionStartNs = GetNowUnixNs();
         saveTimestamp = DateTime.Now.ToString("yyyyMMdd_HHmmss");
 
+        // 3. GENERATE PATHS: This now uses the name we just pulled from the dashboard
         PrepareSessionFolders();
 
+        // 4. RESET STATE
         currentLevel = 1;
         levelTimer = 0f;
         totalGold = 0f;
@@ -156,12 +231,16 @@ public class GameManager : MonoBehaviour
         trialLog.Clear();
         eventLog.Clear();
 
+        // 5. LOG START: The event payload will now show the correct participantName
         LogAndSendEvent(
             "session_start",
-            $"participant={participantName};rewardProb={rewardProbability:F2};depletionProb={depletionProbability:F2};totalLevels={totalLevels};levelDuration={levelDuration:F1}"
+            $"participant={participantName};rewardProb={rewardProbability:F2};flipProb={depletionProbability:F2};totalLevels={totalLevels};levelDuration={levelDuration:F1}"
         );
 
+        SaveTrialsOnly();
+
         StartLevel(1);
+
         Debug.Log($"[GameManager] Session started. Folder: {sessionFolderPath}");
     }
 
@@ -172,19 +251,23 @@ public class GameManager : MonoBehaviour
         levelGold = 0f;
         depletionCount = 0;
 
-        activeRock = UnityEngine.Random.value > 0.5f ? 0 : 1;
+        rock0Active = UnityEngine.Random.value > 0.5f;
+        rock1Active = !rock0Active;
+
         ApplyActiveState();
 
         townLevelManager?.SetLevel(level);
-        ui?.UpdateLevel(level, totalLevels);
+        ui?.UpdateLevel(level);
         ui?.UpdateGold(0f);
+        ui?.UpdateGoldBar(0f);
+        ui?.UpdateResourceLabel(CurrentResourceName, 0f); 
 
         LogAndSendEvent(
             "level_start",
-            $"level={level};activeRock={activeRock};rewardProb={rewardProbability:F2};depletionProb={depletionProbability:F2}"
+            $"level={level};rock0Active={rock0Active};rock1Active={rock1Active};rewardProb={rewardProbability:F2};flipProb={depletionProbability:F2}"
         );
 
-        Debug.Log($"[GameManager] Level {level} started. Active rock: {activeRock}");
+        Debug.Log($"[GameManager] Level {level} started. rock0Active={rock0Active}, rock1Active={rock1Active}");
     }
 
     private IEnumerator TransitionToNextLevel()
@@ -194,7 +277,7 @@ public class GameManager : MonoBehaviour
 
         LogAndSendEvent(
             "level_end",
-            $"level={currentLevel};levelGold={levelGold:F2};totalGold={totalGold:F2};depletions={depletionCount}"
+            $"level={currentLevel};levelGold={levelGold:F2};totalGold={totalGold:F2};flips={depletionCount}"
         );
 
         if (currentLevel >= totalLevels)
@@ -212,6 +295,14 @@ public class GameManager : MonoBehaviour
             SaveTrialsOnly();
 
             Debug.Log("[GameManager] Session complete.");
+
+            if (quitApplicationOnSessionEnd)
+            {
+                Debug.Log($"[GameManager] Quitting application in {quitDelaySeconds} seconds...");
+                yield return new WaitForSeconds(quitDelaySeconds);
+                Application.Quit();
+            }
+
             yield break;
         }
 
@@ -237,24 +328,12 @@ public class GameManager : MonoBehaviour
         SaveTrialsOnly();
     }
 
+    public string CurrentResourceName => levelResources[Mathf.Clamp(currentLevel - 1, 0, levelResources.Length - 1)];
+
     private void ApplyActiveState()
     {
-        rock0?.SetActiveState(activeRock == 0, rewardProbability, depletionProbability);
-        rock1?.SetActiveState(activeRock == 1, rewardProbability, depletionProbability);
-    }
-
-    private void TriggerDepletion()
-    {
-        activeRock = activeRock == 0 ? 1 : 0;
-        depletionCount++;
-        ApplyActiveState();
-
-        LogAndSendEvent(
-            "depletion",
-            $"count={depletionCount};newActiveRock={activeRock};level={currentLevel};levelTime={levelTimer:F3}"
-        );
-
-        Debug.Log($"[GameManager] Depletion #{depletionCount} — new active rock: {activeRock}");
+        rock0?.SetActiveState(rock0Active, rewardProbability, depletionProbability);
+        rock1?.SetActiveState(rock1Active, rewardProbability, depletionProbability);
     }
 
     public MiningResult ResolveMiningAttempt(int rockID)
@@ -262,27 +341,40 @@ public class GameManager : MonoBehaviour
         if (!sessionActive || inTransition)
             return new MiningResult(false, 0f, false);
 
-        bool wasActive = (rockID == activeRock);
+        bool wasActive = rockID == 0 ? rock0Active : rock1Active;
         bool rewarded = false;
-        bool depletionOccurred = false;
         float goldGained = 0f;
 
         if (wasActive)
         {
             rewarded = UnityEngine.Random.value < rewardProbability;
-            depletionOccurred = UnityEngine.Random.value < depletionProbability;
 
             if (rewarded)
             {
                 goldGained = goldPerReward;
                 totalGold += goldGained;
                 levelGold += goldGained;
-                ui?.UpdateGold(levelGold);
+                ui?.UpdateResourceLabel(CurrentResourceName, levelGold);
+                ui?.ShowRewardMessage($"+{goldGained:F0} {CurrentResourceName}!", totalGold);
             }
-
-            if (depletionOccurred)
-                TriggerDepletion();
         }
+
+        bool systemFlipped = UnityEngine.Random.value < depletionProbability;
+
+        if (systemFlipped)
+        {
+            // Inverte ambas simultaneamente
+            rock0Active = !rock0Active;
+            rock1Active = !rock1Active;
+            depletionCount++;
+
+            LogAndSendEvent(
+                "depletion",
+                $"count={depletionCount};systemFlipped=true;rock0Active={rock0Active};rock1Active={rock1Active}"
+            );
+        }
+
+        ApplyActiveState();
 
         trialNumber++;
         float totalTime = (currentLevel - 1) * levelDuration + levelTimer;
@@ -298,22 +390,25 @@ public class GameManager : MonoBehaviour
             rockChosen = rockID,
             wasActiveRock = wasActive,
             rewarded = rewarded,
-            depletionOccurred = depletionOccurred,
+            anyFlipOccurred = systemFlipped,
             goldGained = goldGained,
             levelGold = levelGold,
             totalGold = totalGold,
-            activeRockAfter = activeRock,
+            rock0ActiveAfter = rock0Active,
+            rock1ActiveAfter = rock1Active,
             depletionCount = depletionCount
         });
 
         LogAndSendEvent(
             "trial",
-            $"trial={trialNumber};level={currentLevel};levelTime={levelTimer:F3};totalTime={totalTime:F3};rock={rockID};wasActive={wasActive};rewarded={rewarded};depleted={depletionOccurred};goldGained={goldGained:F2};levelGold={levelGold:F2};totalGold={totalGold:F2};activeRockAfter={activeRock};depletionCount={depletionCount}"
+            $"trial={trialNumber};level={currentLevel};levelTime={levelTimer:F3};totalTime={totalTime:F3};rock={rockID};wasActive={wasActive};rewarded={rewarded};anyFlipOccurred={systemFlipped};goldGained={goldGained:F2};levelGold={levelGold:F2};totalGold={totalGold:F2};rock0ActiveAfter={rock0Active};rock1ActiveAfter={rock1Active};depletionCount={depletionCount}"
         );
 
-        Debug.Log($"[GameManager] Trial {trialNumber} L{currentLevel}: Rock {rockID} active={wasActive} reward={rewarded} depleted={depletionOccurred} gold={totalGold:F0}");
+        Debug.Log($"[GameManager] Trial {trialNumber} L{currentLevel}: Rock {rockID} active={wasActive} reward={rewarded} anyFlipOccurred={systemFlipped}");
 
-        return new MiningResult(rewarded, goldGained, depletionOccurred);
+
+        SaveTrialsOnly(); 
+        return new MiningResult(rewarded, goldGained, systemFlipped);
     }
 
     public void LogExternalEvent(string eventType, string payload)
@@ -395,17 +490,20 @@ public class GameManager : MonoBehaviour
     private string BuildTrialsCsv()
     {
         var sb = new StringBuilder();
+
         sb.AppendLine($"# participant={participantName}");
         sb.AppendLine($"# session_folder={sessionFolderName}");
         sb.AppendLine($"# session_start_ns={sessionStartNs}");
-        sb.AppendLine("trial;level;levelTime;totalTime;unixTimeNs;rockChosen;wasActiveRock;rewarded;depletionOccurred;goldGained;levelGold;totalGold;activeRockAfter;depletionCount");
+        sb.AppendLine("trial;level;levelTime;totalTime;unixTimeNs;rockChosen;wasActiveRock;rewarded;rock0Flipped;rock1Flipped;anyFlipOccurred;goldGained;levelGold;totalGold;rock0ActiveAfter;rock1ActiveAfter;depletionCount");
 
         foreach (var r in trialLog)
         {
             sb.AppendLine(
                 $"{r.trial};{r.level};{r.levelTime:F3};{r.totalTime:F3};{r.unixTimeNs};" +
-                $"{r.rockChosen};{r.wasActiveRock};{r.rewarded};{r.depletionOccurred};" +
-                $"{r.goldGained:F2};{r.levelGold:F2};{r.totalGold:F2};{r.activeRockAfter};{r.depletionCount}"
+                $"{r.rockChosen};{r.wasActiveRock};{r.rewarded};" +
+                $"{r.rock0Flipped};{r.rock1Flipped};{r.anyFlipOccurred};" +
+                $"{r.goldGained:F2};{r.levelGold:F2};{r.totalGold:F2};" +
+                $"{r.rock0ActiveAfter};{r.rock1ActiveAfter};{r.depletionCount}"
             );
         }
 
@@ -450,7 +548,10 @@ public class GameManager : MonoBehaviour
     public string DerivedFolderPath => derivedFolderPath;
 
     public bool IsSessionActive => sessionActive && !inTransition;
-    public int ActiveRock => activeRock;
+
+    public bool Rock0Active => rock0Active;
+    public bool Rock1Active => rock1Active;
+
     public float TotalGold => totalGold;
     public float LevelGold => levelGold;
     public float GoldPerReward => goldPerReward;

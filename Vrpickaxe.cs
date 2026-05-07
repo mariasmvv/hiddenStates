@@ -57,12 +57,6 @@ public class VRPickaxe : MonoBehaviour
     public Transform axeMesh;
 
     // ─────────────────────────────────────────
-    //  Inspector — Legacy LSL
-    // ─────────────────────────────────────────
-    [Header("Optional LSL (legacy)")]
-    public LSLManager lsl;
-
-    // ─────────────────────────────────────────
     //  Runtime State
     // ─────────────────────────────────────────
     [Header("Runtime State (read-only)")]
@@ -101,15 +95,19 @@ public class VRPickaxe : MonoBehaviour
     // ─────────────────────────────────────────
     void Awake()
     {
+        // REMOVED: DontDestroyOnLoad(gameObject); 
+        // By removing the above, we prevent the "Multiplier" lag.
+
         grabInteractable = GetComponent<UnityEngine.XR.Interaction.Toolkit.Interactables.XRGrabInteractable>();
         rb = GetComponent<Rigidbody>();
         axeRenderer = GetComponentInChildren<Renderer>();
+        
+        // We find these in Awake/Start because the Managers are persistent
         gameManager = FindObjectOfType<GameManager>();
         ui = FindObjectOfType<ForagingUI>();
-        if (lsl == null) lsl = FindObjectOfType<LSLManager>();
 
         if (gameManager == null)
-            Debug.LogError("[VRPickaxe] GameManager not found!");
+            Debug.LogWarning("[VRPickaxe] GameManager not found! This is normal if starting from Level 2+ for testing.");
     }
 
     void Start()
@@ -119,22 +117,11 @@ public class VRPickaxe : MonoBehaviour
 
         if (axeMesh == null && transform.childCount > 0)
             axeMesh = transform.GetChild(0);
-        if (axeMesh == null)
-            Debug.LogWarning("[VRPickaxe] No axeMesh assigned — swing animation disabled.");
-
+        
         meshBaseLocalRotation = axeMesh != null ? axeMesh.localRotation : Quaternion.identity;
 
-        foreach (var r in FindObjectsOfType<OrbManager>())
-        {
-            if (r.rockID == 0) rock0 = r;
-            if (r.rockID == 1) rock1 = r;
-        }
-
-        if (rock0Transform == null && rock0 != null) rock0Transform = rock0.transform;
-        if (rock1Transform == null && rock1 != null) rock1Transform = rock1.transform;
-
-        if (rock0 == null) Debug.LogError("[VRPickaxe] Rock 0 not found!");
-        if (rock1 == null) Debug.LogError("[VRPickaxe] Rock 1 not found!");
+        // CRITICAL: This finds the rocks in the CURRENT scene
+        RefreshRockReferences();
 
         rb.isKinematic = true;
 
@@ -143,6 +130,21 @@ public class VRPickaxe : MonoBehaviour
 
         SetAxeColor(readyColor);
         BuildLaserLine();
+    }
+
+    private void RefreshRockReferences()
+    {
+        rock0 = null;
+        rock1 = null;
+
+        foreach (var r in FindObjectsOfType<OrbManager>())
+        {
+            if (r.rockID == 0) rock0 = r;
+            if (r.rockID == 1) rock1 = r;
+        }
+
+        if (rock0 != null) rock0Transform = rock0.transform;
+        if (rock1 != null) rock1Transform = rock1.transform;
     }
 
     // ─────────────────────────────────────────
@@ -180,22 +182,34 @@ public class VRPickaxe : MonoBehaviour
     // ─────────────────────────────────────────
     //  Update Loop
     // ─────────────────────────────────────────
-    void Update()
-    {
-        if (isFloatingBack) { FloatBack(); return; }
-        if (isOnAxeCooldown) { TickAxeCooldown(); return; }
-        if (!isHeld) return;
-        if (gameManager != null && !gameManager.IsSessionActive) return;
+ void Update()
+{
+    if (isFloatingBack) { FloatBack(); return; }
+    if (isOnAxeCooldown) { TickAxeCooldown(); return; }
+    if (!isHeld) return;
 
-        HandleMiningAim();
-        AnimateSwing();
+    // FIX: Only check sessionActive if we are NOT in the intro
+    bool isIntro = UnityEngine.SceneManagement.SceneManager.GetActiveScene().buildIndex == 0;
+    if (!isIntro)
+    {
+        if (gameManager != null && !gameManager.IsSessionActive) return;
     }
 
+    HandleMiningAim();
+    AnimateSwing();
+}
     // ─────────────────────────────────────────
     //  Grab / Release
     // ─────────────────────────────────────────
     private void OnGrabbed(SelectEnterEventArgs args)
     {
+        // Re-find references just in case of scene transition timing
+        if (gameManager == null) gameManager = FindObjectOfType<GameManager>();
+        if (ui == null) ui = FindObjectOfType<ForagingUI>();
+        
+        // Ensure the rock we are grabbing for is still valid
+        RefreshRockReferences();
+
         if (isOnAxeCooldown)
         {
             grabInteractable.interactionManager.CancelInteractorSelection(
@@ -208,8 +222,6 @@ public class VRPickaxe : MonoBehaviour
         isHeld = true;
         miningProgress = 0f;
         isMining = false;
-        isAimingAtRock = false;
-        swingAngle = 0f;
         activeHand = args.interactorObject.transform;
 
         isRightHand = IsRightHand(activeHand);
@@ -225,8 +237,6 @@ public class VRPickaxe : MonoBehaviour
 
         string rockLabel = isRightHand ? "right rock" : "left rock";
         ui?.ShowMessage($"Point axe at {rockLabel} to mine", 2f);
-
-        Debug.Log($"[VRPickaxe] Grabbed — {(isRightHand ? "RIGHT" : "LEFT")} hand → Rock {activeRockID}");
     }
 
     private void OnReleased(SelectExitEventArgs args)
@@ -253,79 +263,56 @@ public class VRPickaxe : MonoBehaviour
     // ─────────────────────────────────────────
     //  Mining — Laser Aim Detection
     // ─────────────────────────────────────────
-    private void HandleMiningAim()
+    // Inside VRPickaxe.cs -> HandleMiningAim()
+private void HandleMiningAim()
+{
+    if (currentRock == null) return;
+
+    if (currentRock.IsOnCooldown)
     {
-        if (currentRock == null) return;
+        isMining = false;
+        miningProgress = 0f;
+        currentRock.HideProgressBar();
+        UpdateLaser(false);
+        return; 
+    }
 
-        if (currentRock.IsOnCooldown)
+    Ray ray = new Ray(transform.position, transform.forward);
+    bool hitThisRock = false;
+
+    if (Physics.Raycast(ray, out RaycastHit hit, miningRange))
+    {
+        OrbManager hitOrb = hit.collider.GetComponent<OrbManager>();
+        if (hitOrb == null) hitOrb = hit.collider.GetComponentInParent<OrbManager>();
+        
+        // This is the "Recognition" part
+        hitThisRock = hitOrb != null && hitOrb == currentRock;
+    }
+
+    isAimingAtRock = hitThisRock;
+    UpdateLaser(hitThisRock);
+
+    if (isAimingAtRock)
+    {
+        if (!isMining)
         {
-            if (isMining)
-            {
-                isMining = false;
-                miningProgress = 0f;
-                currentRock.HideProgressBar();
-            }
-            UpdateLaser(false);
-            return;
+            isMining = true;
+            miningProgress = 0f;
         }
 
-        Ray ray = new Ray(transform.position, transform.forward);
-        bool hitThisRock = false;
+        miningProgress += Time.deltaTime / miningDuration;
+        miningProgress = Mathf.Clamp01(miningProgress);
+        currentRock.UpdateProgressBar(miningProgress);
 
-        if (Physics.Raycast(ray, out RaycastHit hit, miningRange))
+        if (miningProgress >= 1f)
         {
-            OrbManager hitOrb = hit.collider.GetComponent<OrbManager>();
-            if (hitOrb == null) hitOrb = hit.collider.GetComponentInParent<OrbManager>();
-            hitThisRock = hitOrb != null && hitOrb == currentRock;
-        }
-
-        isAimingAtRock = hitThisRock;
-        UpdateLaser(hitThisRock);
-
-        if (isAimingAtRock)
-        {
-            if (!isMining)
-            {
-                isMining = true;
-                miningProgress = 0f;
-
-                gameManager?.LogExternalEvent(
-                    "mine_start",
-                    $"rock={activeRockID};level={gameManager.CurrentLevel};levelElapsed={gameManager.CurrentLevelElapsedTime:F3};levelTimeRemaining={gameManager.LevelTimeRemaining:F3}"
-                );
-
-                Debug.Log("[VRPickaxe] Mining started.");
-            }
-
-            miningProgress += Time.deltaTime / miningDuration;
-            miningProgress = Mathf.Clamp01(miningProgress);
-            currentRock.UpdateProgressBar(miningProgress);
-
-            if (miningProgress >= 1f)
-            {
-                isMining = false;
-                miningProgress = 0f;
-                currentRock.HideProgressBar();
-                ResolveMiningAttempt();
-            }
-        }
-        else
-        {
-            if (isMining)
-            {
-                gameManager?.LogExternalEvent(
-                    "mine_cancel",
-                    $"rock={activeRockID};level={gameManager.CurrentLevel};levelElapsed={gameManager.CurrentLevelElapsedTime:F3};levelTimeRemaining={gameManager.LevelTimeRemaining:F3};progress={miningProgress:F2}"
-                );
-
-                isMining = false;
-                miningProgress = 0f;
-                currentRock.HideProgressBar();
-                swingAngle = 0f;
-                Debug.Log("[VRPickaxe] Mining cancelled — not aimed at rock.");
-            }
+            // CHANGE THIS LINE: Redirect to a new local method
+            ResolveMiningResolution(); 
+            isMining = false;
+            miningProgress = 0f;
         }
     }
+}
 
     // ─────────────────────────────────────────
     //  Swing Animation
@@ -337,7 +324,7 @@ public class VRPickaxe : MonoBehaviour
         if (!isMining)
         {
             swingAngle = Mathf.Lerp(swingAngle, 0f, returnSpeed * Time.deltaTime);
-            axeMesh.localRotation = meshBaseLocalRotation * Quaternion.Euler(swingAngle, 0f, 0f);
+            axeMesh.localRotation = meshBaseLocalRotation * Quaternion.Euler(0f, 270f, swingAngle);
             return;
         }
 
@@ -356,31 +343,46 @@ public class VRPickaxe : MonoBehaviour
         float t = (Mathf.Sin(Time.time * speed) + 1f) * 0.5f;
         swingAngle = Mathf.Lerp(back, forward, t);
 
-        axeMesh.localRotation = meshBaseLocalRotation * Quaternion.Euler(swingAngle, 0f, 0f);
+        axeMesh.localRotation = meshBaseLocalRotation * Quaternion.Euler(0f, 270f, swingAngle);
     }
 
-    // ─────────────────────────────────────────
-    //  Mining Resolution
-    // ─────────────────────────────────────────
-    private void ResolveMiningAttempt()
-    {
-        if (gameManager == null || currentRock == null) return;
-        if (!currentRock.TryHit()) return;
+private void ResolveMiningResolution()
+{
+    if (currentRock == null) return;
+    if (!currentRock.TryHit()) return;
 
+    // Check if we are in the Intro (Scene 0)
+    if (UnityEngine.SceneManagement.SceneManager.GetActiveScene().buildIndex == 0)
+    {
+        PracticeManager pm = FindObjectOfType<PracticeManager>();
+        if (pm != null)
+        {
+            // FIX: Pass activeRockID (int) instead of isRightHand (bool)
+            pm.ResolvePracticeHit(activeRockID); 
+            currentRock.PlayFeedback(true); 
+        }
+    }
+    else
+    {
+        // Real game logic for Level 1-5
+        if (gameManager == null) gameManager = FindObjectOfType<GameManager>();
+        
         MiningResult result = gameManager.ResolveMiningAttempt(activeRockID);
         currentRock.PlayFeedback(result.rewarded);
 
         if (result.rewarded)
         {
-            ui?.ShowRewardMessage($"+{result.goldGained:F0} Gold!", gameManager.TotalGold);
-            Debug.Log($"[VRPickaxe] GOLD! +{result.goldGained}");
+            string resource = gameManager.CurrentResourceName; 
+            ui?.ShowRewardMessage($"+{result.goldGained:F0} {resource}!", gameManager.TotalGold);
+            
+            ui?.UpdateGoldBar(gameManager.TotalGold);
         }
         else
         {
             ui?.ShowMessage("Nothing... try again or switch rocks!", 1.5f);
-            Debug.Log("[VRPickaxe] No gold.");
         }
     }
+}
 
     // ─────────────────────────────────────────
     //  Axe Cooldown

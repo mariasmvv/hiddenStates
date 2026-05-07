@@ -33,9 +33,9 @@ public class OrbManager : MonoBehaviour
     public Color noRewardColor = new Color(0.35f, 0.35f, 0.35f);
     public float flashDuration = 0.4f;
 
-    [Header("Effects")]
-    public ParticleSystem rewardParticles;
-    public ParticleSystem dustParticles;
+    // [Header("Effects")]
+// public GameObject rewardParticles;
+// public GameObject dustParticles;
 
     [Header("Progress Bar")]
     [Tooltip("How high above the rock centre the progress bar floats (metres)")]
@@ -85,53 +85,61 @@ public class OrbManager : MonoBehaviour
     //  Simple horizontal bar — no sprite required, works on all Unity versions.
     // ─────────────────────────────────────────
     private void BuildProgressBar()
-    {
-        // Canvas
-        barCanvasGO = new GameObject($"Rock{rockID}_ProgressCanvas");
-        barCanvasGO.transform.SetParent(transform);
-        barCanvasGO.transform.localPosition = Vector3.up * progressBarHeight;
-        barCanvasGO.transform.localRotation = Quaternion.identity;
+{
+    // 1. Canvas Setup
+    barCanvasGO = new GameObject($"Rock{rockID}_ProgressCanvas");
+    barCanvasGO.transform.SetParent(transform);
+    barCanvasGO.transform.localPosition = Vector3.up * progressBarHeight;
+    barCanvasGO.transform.localRotation = Quaternion.identity;
 
-        Canvas canvas     = barCanvasGO.AddComponent<Canvas>();
-        canvas.renderMode = RenderMode.WorldSpace;
+    Canvas canvas = barCanvasGO.AddComponent<Canvas>();
+    canvas.renderMode = RenderMode.WorldSpace;
 
-        // Canvas is 200×20 px, scaled to progressBarSize wide in world units
-        RectTransform canvasRT = barCanvasGO.GetComponent<RectTransform>();
-        canvasRT.sizeDelta     = new Vector2(200f, 20f);
-        float s = progressBarSize / 200f;
-        barCanvasGO.transform.localScale = new Vector3(s, s, s);
+    RectTransform canvasRT = barCanvasGO.GetComponent<RectTransform>();
+    canvasRT.sizeDelta = new Vector2(200f, 20f);
+    float s = progressBarSize / 200f;
+    barCanvasGO.transform.localScale = new Vector3(s, s, s);
 
-        // Dark background — full width
-        GameObject bgGO    = new GameObject("BarBg", typeof(RectTransform), typeof(Image));
-        bgGO.transform.SetParent(barCanvasGO.transform, false);
-        RectTransform bgRT = bgGO.GetComponent<RectTransform>();
-        bgRT.anchorMin     = Vector2.zero;
-        bgRT.anchorMax     = Vector2.one;
-        bgRT.offsetMin     = Vector2.zero;
-        bgRT.offsetMax     = Vector2.zero;
-        barBg              = bgGO.GetComponent<Image>();
-        barBg.color        = new Color(0f, 0f, 0f, 0.55f);
-        // Simple type — no sprite needed
-        barBg.type         = Image.Type.Simple;
+    // 2. CREATE SHARP PIXEL SPRITE (Fixes the "fading edges" look)
+    Texture2D tex = new Texture2D(1, 1);
+    tex.SetPixel(0, 0, Color.white);
+    tex.Apply();
+    Sprite pixelSprite = Sprite.Create(tex, new Rect(0, 0, 1, 1), new Vector2(0.5f, 0.5f));
 
-        // Gold fill — anchored left, width driven by fillAmount via scale in UpdateProgressBar
-        GameObject fillGO    = new GameObject("BarFill", typeof(RectTransform), typeof(Image));
-        fillGO.transform.SetParent(barCanvasGO.transform, false);
-        RectTransform fillRT = fillGO.GetComponent<RectTransform>();
-        fillRT.anchorMin     = new Vector2(0f, 0.1f);
-        fillRT.anchorMax     = new Vector2(1f, 0.9f);
-        fillRT.offsetMin     = new Vector2(2f, 0f);
-        fillRT.offsetMax     = new Vector2(-2f, 0f);
-        fillRT.pivot         = new Vector2(0f, 0.5f); // scale from left edge
-        barFill              = fillGO.GetComponent<Image>();
-        barFill.color        = new Color(1f, 0.85f, 0.1f, 1f);
-        barFill.type         = Image.Type.Filled;
-        barFill.fillMethod   = Image.FillMethod.Horizontal;
-        barFill.fillOrigin   = (int)Image.OriginHorizontal.Left;
-        barFill.fillAmount   = 0f;
+    // 3. Dark Background Track (The Size Comparison Bar)
+    GameObject bgGO = new GameObject("BarBg", typeof(RectTransform), typeof(Image));
+    bgGO.transform.SetParent(barCanvasGO.transform, false);
+    RectTransform bgRT = bgGO.GetComponent<RectTransform>();
+    bgRT.anchorMin = Vector2.zero;
+    bgRT.anchorMax = Vector2.one;
+    bgRT.offsetMin = Vector2.zero;
+    bgRT.offsetMax = Vector2.zero;
+    
+    barBg = bgGO.GetComponent<Image>();
+    barBg.sprite = pixelSprite; // Using sharp sprite
+    barBg.color = new Color(1f, 1f, 1f, 0.12f); // Matching your UI faint gray
 
-        barCanvasGO.AddComponent<BillboardToCamera>();
-    }
+    // 4. Yellow Fill Bar (The solid growing bar)
+    GameObject fillGO = new GameObject("BarFill", typeof(RectTransform), typeof(Image));
+    fillGO.transform.SetParent(bgGO.transform, false);
+    RectTransform fillRT = fillGO.GetComponent<RectTransform>();
+    
+    // Stretch to match background exactly
+    fillRT.anchorMin = Vector2.zero;
+    fillRT.anchorMax = Vector2.one;
+    fillRT.offsetMin = Vector2.zero;
+    fillRT.offsetMax = Vector2.zero;
+    
+    barFill = fillGO.GetComponent<Image>();
+    barFill.sprite = pixelSprite; // Using sharp sprite
+    barFill.color = new Color(1f, 0.85f, 0f, 1f); // Solid Gold
+    barFill.type = Image.Type.Filled;
+    barFill.fillMethod = Image.FillMethod.Horizontal;
+    barFill.fillOrigin = (int)Image.OriginHorizontal.Left;
+    barFill.fillAmount = 0f;
+
+    barCanvasGO.AddComponent<BillboardToCamera>();
+}
 
     // ─────────────────────────────────────────
     //  Called by GameManager
@@ -157,18 +165,21 @@ public class OrbManager : MonoBehaviour
     //  Progress Bar
     // ─────────────────────────────────────────
     public void UpdateProgressBar(float t)
+{
+    if (barCanvasGO == null) return;
+    barCanvasGO.SetActive(true);
+
+    t = Mathf.Clamp01(t);
+    
+    if (barFill != null)
     {
-        if (barCanvasGO == null) return;
-        barCanvasGO.SetActive(true);
-
-        t = Mathf.Clamp01(t);
-        if (barFill != null) barFill.fillAmount = t;
-
-        if (barFill != null)
-            barFill.color = Color.Lerp(
-                new Color(1f, 1f, 1f, 0.8f),
-                new Color(1f, 0.85f, 0.1f, 1f), t);
+        // Physically grow the bar
+        barFill.fillAmount = t;
+        
+        // KEEP COLOR SOLID: Removed Lerp to maintain constant intensity
+        barFill.color = new Color(1f, 0.85f, 0f, 1f); 
     }
+}
 
     public void HideProgressBar()
     {
@@ -181,22 +192,30 @@ public class OrbManager : MonoBehaviour
     //  Flash Feedback
     // ─────────────────────────────────────────
     private IEnumerator FlashFeedback(bool rewarded)
+{
+    isOnCooldown = true;
+
+    // --- REMOVED PARTICLE LOGIC ---
+    /* GameObject prefabToSpawn = rewarded ? rewardParticles : dustParticles;
+    if (prefabToSpawn != null)
     {
-        isOnCooldown = true;
-
-        if (rewarded  && rewardParticles != null) rewardParticles.Play();
-        if (!rewarded && dustParticles   != null) dustParticles.Play();
-
-        SetColor(rewarded ? rewardColor : noRewardColor);
-        yield return new WaitForSeconds(flashDuration);
-        SetBaseVisual();
-
-        float remaining = cooldownDuration - flashDuration;
-        if (remaining > 0f)
-            yield return new WaitForSeconds(remaining);
-
-        isOnCooldown = false;
+        GameObject effectInstance = Instantiate(prefabToSpawn, transform.position, Quaternion.identity);
+        Destroy(effectInstance, 3.0f);
     }
+    */
+    // ------------------------------
+
+    // Keep the color flash so the player knows the mine was successful
+    SetColor(rewarded ? rewardColor : noRewardColor);
+    yield return new WaitForSeconds(flashDuration);
+    SetBaseVisual();
+
+    float remaining = cooldownDuration - flashDuration;
+    if (remaining > 0f)
+        yield return new WaitForSeconds(remaining);
+
+    isOnCooldown = false;
+}
 
     // ─────────────────────────────────────────
     //  Helpers

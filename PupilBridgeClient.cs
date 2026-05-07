@@ -29,7 +29,7 @@ public class PupilBridgeClient : MonoBehaviour
     //   The port must match the port bridge.py is listening on (default 8765).
     // ──────────────────────────────────────────────────────────
     [Header("── Laptop IP & Port (EDIT THIS) ──")]
-    public string bridgeUrl = "http://192.168.1.50:8765";
+    public string bridgeUrl = "http://192.168.137.1:8765";
 
     /// <summary>Call from GameManager.Awake() to set URL from one central place.</summary>
     public void SetUrl(string url) { bridgeUrl = url; }
@@ -58,8 +58,16 @@ public class PupilBridgeClient : MonoBehaviour
     // ─────────────────────────────────────────
     void Awake()
     {
+        if (FindObjectsOfType<PupilBridgeClient>().Length > 1)
+    {
+        Destroy(gameObject);
+        return;
+    }
+        DontDestroyOnLoad(gameObject);
         unixOriginNs  = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() * 1_000_000L;
         swOriginTicks = Stopwatch.GetTimestamp();
+
+        StartCoroutine(Initialize());
     }
 
     // ─────────────────────────────────────────

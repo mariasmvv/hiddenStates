@@ -1,69 +1,57 @@
 using UnityEngine;
+using UnityEngine.SceneManagement;
 
 /// <summary>
-/// Manages the 5 town level GameObjects.
-/// Called by GameManager at the start of each level.
-///
-/// IMPORTANT:
-///   Town level advances on a TIME schedule (every 5 minutes)
-///   NOT based on gold. Gold is cosmetic only.
-///
-/// SETUP:
-///   1. Create empty GameObject called "TownLevelManager"
-///   2. Attach this script
-///   3. In Inspector assign each town level parent GameObject:
-///      townLevels[0] = TownLevel_1 (ruins)
-///      townLevels[1] = TownLevel_2 (foundations)
-///      townLevels[2] = TownLevel_3 (buildings)
-///      townLevels[3] = TownLevel_4 (almost complete)
-///      townLevels[4] = TownLevel_5 (fully rebuilt)
+/// Manages transitions between town level Scenes.
+/// Each scene should contain its own unique terrain and layout.
 /// </summary>
 public class TownLevelManager : MonoBehaviour
 {
-    // ─────────────────────────────────────────
-    //  Inspector
-    // ─────────────────────────────────────────
-    [Header("Town Level GameObjects (assign in order 1-5)")]
-    public GameObject[] townLevels = new GameObject[5];
+    [Header("Scene Names (Assign in order 1-5)")]
+    [Tooltip("Ensure these names match exactly with scenes in Build Settings")]
+    public string[] townSceneNames = new string[5];
 
-    // ─────────────────────────────────────────
-    //  Runtime
-    // ─────────────────────────────────────────
     [Header("Runtime (read-only)")]
     [SerializeField] private int currentLevel = 1;
 
-    // ─────────────────────────────────────────
-    //  Unity Lifecycle
-    // ─────────────────────────────────────────
     void Start()
     {
-        for (int i = 0; i < townLevels.Length; i++)
-            if (townLevels[i] == null)
-                Debug.LogWarning($"[TownLevelManager] townLevels[{i}] not assigned!");
 
-        SetLevel(1);
     }
 
-    // ─────────────────────────────────────────
-    //  Public API
-    // ─────────────────────────────────────────
-
     /// <summary>
-    /// Activates the town level GameObject for the given level
-    /// and deactivates all others. Level is 1-based (1 through 5).
+    /// Loads the scene for the given level.
+    /// Level is 1-based (1 through 5).
     /// </summary>
+    void Awake()
+    {
+        if (FindObjectsOfType<TownLevelManager>().Length > 1)
+    {
+        Destroy(gameObject);
+        return;
+    }
+        // Ensure the scene loader survives the transition it triggers
+        DontDestroyOnLoad(gameObject);
+    } 
+    
     public void SetLevel(int level)
     {
-        level = Mathf.Clamp(level, 1, townLevels.Length);
+        level = Mathf.Clamp(level, 1, townSceneNames.Length);
+        
+        string sceneToLoad = townSceneNames[level - 1];
 
-        for (int i = 0; i < townLevels.Length; i++)
+        if (!string.IsNullOrEmpty(sceneToLoad))
         {
-            if (townLevels[i] == null) continue;
-            townLevels[i].SetActive(i == level - 1);
+            currentLevel = level;
+            Debug.Log($"[TownLevelManager] Loading Scene: {sceneToLoad}");
+            
+            // This will unload the current scene and load the new one
+            SceneManager.LoadScene(sceneToLoad, LoadSceneMode.Single);
         }
-
-        currentLevel = level;
-        Debug.Log($"[TownLevelManager] Town set to level {level}");
+        else
+        {
+            Debug.LogError($"[TownLevelManager] Scene name at index {level - 1} is empty!");
+        }
     }
 
     public int CurrentLevel => currentLevel;

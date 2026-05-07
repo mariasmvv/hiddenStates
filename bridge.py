@@ -1,206 +1,164 @@
 """
 Rustbucket VR — Pupil Labs Bridge
-=================================
+===================================
 Run on the laptop BEFORE starting the Unity game.
 
-    pip install pupil-labs-realtime-api
+    pip install pupil-labs-realtime-api pandas opencv-python
     python bridge.py
 
 What it does:
-  1. Connects to Pupil Companion
-  2. Estimates laptop↔Companion clock offset
-  3. Serves:
-       GET  /sync
-       GET  /status
-       POST /event
+  1. Connects to Pupil Companion on the phone
+  2. Calculates the clock offset (Quest time → Companion time)
+  3. Serves a tiny HTTP server the Quest talks to:
+       GET  /sync   → returns offset so Unity can correct its timestamps
+       POST /event  → receives a game event, injects it into the recording
+  4. After the session, merges game CSVs with gaze export and annotates
+     the eye video with event markers.
+
+Requirements:
+  - Pupil Companion app open and streaming on the phone
+  - Phone and laptop on the same Wi-Fi
+  - Unity Quest talking to this laptop's IP on port 8765
 """
 
 import json
-import sys
 import time
 import threading
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import urlparse
+import csv
+import os
+import sys
+from http.server import BaseHTTPRequestHandler, HTTPServer
+from datetime import datetime
+
+import pandas as pd
+import cv2
 
 from pupil_labs.realtime_api.simple import Device
 
 # ──────────────────────────────────────────────
-# Config
+#  Config
 # ──────────────────────────────────────────────
-HOST = "0.0.0.0"
 PORT = 8765
-
-PUPIL_DEVICE_IP = "192.168.137.249"   # IP adress of the Pupil Companion app
-PUPIL_DEVICE_PORT = 8080
-
-OFFSET_REFRESH_SEC = 10.0   #time in seconds between re-sync of the clocks
-
-device = None
-device_lock = threading.Lock()  
-
-offset_lock = threading.Lock()
-host_minus_companion_ns = 0    #clock difference in nanoseconds between the laptop and the Pupil device
-offset_std_ms = None           # standard deviation (how uncertain the offset estimate is)
-offset_last_updated_ns = 0     #time in which the last offset was calculated
-
+OUTPUT_DIR = "session_output"
+os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 # ──────────────────────────────────────────────
-# Pupil connection / offset refresh
+#  Step 1 — Connect to Pupil Companion & sync
 # ──────────────────────────────────────────────
-def connect_device():
-    global device
-    try:
-        device = Device(address=PUPIL_DEVICE_IP, port=PUPIL_DEVICE_PORT)
-        print(f"Connected to Pupil device at {PUPIL_DEVICE_IP}:{PUPIL_DEVICE_PORT}")
-    except Exception as e:
-        sys.exit(f"Could not connect to Pupil device: {e}")  #quits immediatly if it can´t connect
+device = Device(address="192.168.137.24", port=8080)
 
+print("Calculating time offset...")
+estimate = device.estimate_time_offset()
+if estimate is None:
+    device.close()
+    sys.exit("Pupil Companion app is too old — please update it.")
 
-def refresh_offset():
-    global host_minus_companion_ns, offset_std_ms, offset_last_updated_ns
-
-    try:
-        with device_lock:
-            estimate = device.estimate_time_offset()    #ask Pupil device for the clock difference
-
-        if estimate is None:
-            print("[warn] No time-offset estimate returned.")
-            return
-
-        # converts from milliseconds to nanoseconds for precision
-        mean_ms = float(estimate.time_offset_ms.mean)
-        std_ms = float(estimate.time_offset_ms.std)
-
-        with offset_lock:
-            host_minus_companion_ns = int(mean_ms * 1_000_000)
-            offset_std_ms = std_ms
-            offset_last_updated_ns = time.time_ns() #record when we last updated
-
-        print(
-            f"[offset] host-companion = {mean_ms:.2f} ms "
-            f"(std={std_ms:.2f} ms)"
-        )
-
-    except Exception as e:
-        print(f"[warn] Failed to refresh offset: {e}")
-
-
-def offset_loop():
-    #always runs in the background, refreshing the clock offset every 10 seconds
-    while True:
-        refresh_offset()
-        time.sleep(OFFSET_REFRESH_SEC)
-
+# host_minus_companion_ns: add this to companion time to get host (laptop) time
+# We want companion_ns = host_ns - host_minus_companion_ns
+host_minus_companion_ns = int(estimate.time_offset_ms.mean * 1_000_000)
+print(f"  Offset (host - companion): {host_minus_companion_ns / 1e6:.3f} ms")
+print(f"  Roundtrip: {estimate.roundtrip_duration_ms.mean:.3f} ms")
 
 # ──────────────────────────────────────────────
-# HTTP handler
+#  Shared state (thread-safe via lock)
+# ──────────────────────────────────────────────
+lock = threading.Lock()
+events = []  # list of dicts saved by /event handler
+session_start_time = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+# ──────────────────────────────────────────────
+#  Step 2 — HTTP server the Quest talks to
 # ──────────────────────────────────────────────
 class Handler(BaseHTTPRequestHandler):
-    def log_message(self, fmt, *args):
-        return  #silence the default request logging
 
-    def _send_json(self, obj, code=200):
-        #helper : convert a Python dict to JSON and send it as the HTTP response
-        data = json.dumps(obj).encode("utf-8")
+    def log_message(self, format, *args):
+        pass  # suppress default access log noise
+
+    # ── GET /sync ──────────────────────────────
+    # Unity calls this to measure Quest↔laptop offset.
+    # Returns laptop timestamps so Unity can compute quest_minus_host.
+    def do_GET(self):
+        if self.path != "/sync":
+            self._send(404, {"error": "not found"})
+            return
+
+        receive_ns = time.time_ns()
+        send_ns = time.time_ns()
+
+        self._send(200, {
+            "ok": True,
+            "server_receive_ns": receive_ns,
+            "server_send_ns": send_ns,
+            "host_minus_companion_ns": host_minus_companion_ns,
+        })
+
+    # ── POST /event ────────────────────────────
+    # Unity sends: { "name": "trial;...", "companion_timestamp_ns": 12345 }
+    def do_POST(self):
+        length = int(self.headers.get("Content-Length", 0))
+        body = self.rfile.read(length)
+
+        if self.path == "/event":
+            try:
+                data = json.loads(body)
+                name = data.get("name", "unknown")
+                companion_ts_ns = int(data.get("companion_timestamp_ns", time.time_ns()))
+
+                # Inject into Pupil recording
+                try:
+                    device.send_event(name, event_timestamp_unix_ns=companion_ts_ns)
+                except Exception as e:
+                    print(f"  [warn] Could not send event to Pupil: {e}")
+
+                # Save locally too
+                with lock:
+                    events.append({
+                        "companion_timestamp_ns": companion_ts_ns,
+                        "name": name,
+                        "received_host_ns": time.time_ns(),
+                    })
+
+                print(f"  [event] {name[:80]}")
+                self._send(200, {"ok": True})
+
+            except Exception as e:
+                print(f"  [error] /event: {e}")
+                self._send(400, {"ok": False, "error": str(e)})
+
+        elif self.path == "/csv":
+            # Unity can POST its game CSV here for safe-keeping
+            filename = self.headers.get("X-Filename", f"game_{session_start_time}.csv")
+            path = os.path.join(OUTPUT_DIR, filename)
+            with open(path, "wb") as f:
+                f.write(body)
+            print(f"  [csv] Saved {filename}")
+            self._send(200, {"ok": True})
+
+        else:
+            self._send(404, {"error": "not found"})
+
+    def _send(self, code, obj):
+        payload = json.dumps(obj).encode()
         self.send_response(code)
         self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Content-Length", len(payload))
         self.end_headers()
-        self.wfile.write(data)
+        self.wfile.write(payload)
 
-    def _read_json(self):
-        # helper: read the JSON body from an incoming POST request
-        n = int(self.headers.get("Content-Length", "0"))
-        raw = self.rfile.read(n) if n > 0 else b"{}"
-        return json.loads(raw.decode("utf-8"))
 
-    def do_GET(self):
-        path = urlparse(self.path).path
-
-        if path == "/sync":
-            #unity calls this to get the clock offset and the server timestamps
-            t_recv = time.time_ns() #record when the request arrived
-            with offset_lock:
-                hmcn = host_minus_companion_ns
-                std = offset_std_ms
-                upd = offset_last_updated_ns
-            t_send = time.time_ns()  #record when we're about to reply
-
-            self._send_json({
-                "ok": True,
-                "server_receive_ns": t_recv,
-                "server_send_ns": t_send,
-                "host_minus_companion_ns": hmcn,
-                "offset_std_ms": std,
-                "offset_last_updated_ns": upd,
-            })
-            return
-
-        if path == "/status":
-            #Unity calls this to check the brigde is running and see the lastest offset
-            with offset_lock:
-                self._send_json({
-                    "ok": True,
-                    "host_minus_companion_ns": host_minus_companion_ns,
-                    "offset_std_ms": offset_std_ms,
-                    "offset_last_updated_ns": offset_last_updated_ns,
-                })
-            return
-
-        self._send_json({"ok": False, "error": "Not found"}, 404)
-
-    def do_POST(self):
-        path = urlparse(self.path).path
-
-        if path == "/event":
-            try:
-                body = self._read_json()
-                name = str(body["name"]) # event label
-                ts_ns = int(body["companion_timestamp_ns"]) # timestamp already in Pupil time
-
-                with device_lock:
-                    # send the event to the Pupil device so it gets recorded in the eye-tracking data
-                    event = device.send_event(name, event_timestamp_unix_ns=ts_ns)
-
-                print(f"[event] {name[:120]}")
-                self._send_json({
-                    "ok": True,
-                    "event_name": event.name,
-                    "event_timestamp_unix_ns": int(event.timestamp_unix_ns),
-                    "recording_id": getattr(event, "recording_id", None),
-                })
-            except Exception as e:
-                self._send_json({"ok": False, "error": str(e)}, 500)
-            return
-
-        self._send_json({"ok": False, "error": "Not found"}, 404)
-
+server = HTTPServer(("0.0.0.0", PORT), Handler)
+server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+server_thread.start()
+print(f"\nBridge running on port {PORT}. Press Ctrl+C when the session is done.\n")
 
 # ──────────────────────────────────────────────
-# Main
+#  Step 3 — Wait for session to finish
 # ──────────────────────────────────────────────
-def main():
-    connect_device() # connect to Pupil Companion
-    refresh_offset() # immediately get the first clock offset 
-    threading.Thread(target=offset_loop, daemon=True).start() # keep refreshing in background
+try:
+    while True:
+        time.sleep(1)
+except KeyboardInterrupt:
+    print("\nSession ended. Saving events and running post-processing...")
 
-    server = ThreadingHTTPServer((HOST, PORT), Handler) # create the HTTP server
-    print(f"Bridge running on http://{HOST}:{PORT}")
-    print("Press Ctrl+C to stop.\n")
-
-    try:
-        server.serve_forever()  # start handling requests from Unity
-    except KeyboardInterrupt:
-        print("\nStopping bridge...")
-    finally:
-        server.shutdown()
-        if device is not None:
-            with device_lock:
-                try:
-                    device.close() #disconnect from the Pupil device on exit
-                except Exception:
-                    pass
-
-
-if __name__ == "__main__":
-    main()
+server.shutdown()
+device.close()
