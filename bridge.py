@@ -45,7 +45,7 @@ os.makedirs(OUTPUT_DIR, exist_ok=True)
 # ──────────────────────────────────────────────
 #  Step 1 — Connect to Pupil Companion & sync
 # ──────────────────────────────────────────────
-device = Device(address="192.168.137.24", port=8080)
+device = Device(address="10.40.50.57", port=8080)
 
 print("Calculating time offset...")
 estimate = device.estimate_time_offset()
@@ -70,9 +70,8 @@ session_start_time = datetime.now().strftime("%Y%m%d_%H%M%S")
 #  Step 2 — HTTP server the Quest talks to
 # ──────────────────────────────────────────────
 class Handler(BaseHTTPRequestHandler):
-
     def log_message(self, format, *args):
-        pass  # suppress default access log noise
+        pass
 
     # ── GET /sync ──────────────────────────────
     # Unity calls this to measure Quest↔laptop offset.
@@ -108,7 +107,7 @@ class Handler(BaseHTTPRequestHandler):
                 try:
                     device.send_event(name, event_timestamp_unix_ns=companion_ts_ns)
                 except Exception as e:
-                    print(f"  [warn] Could not send event to Pupil: {e}")
+                    print(f"  [warn] Could not send event to Pupil: {e}", flush=True)
 
                 # Save locally too
                 with lock:
@@ -118,11 +117,11 @@ class Handler(BaseHTTPRequestHandler):
                         "received_host_ns": time.time_ns(),
                     })
 
-                print(f"  [event] {name[:80]}")
+                print(f"  [event] {name[:80]}", flush=True)
                 self._send(200, {"ok": True})
 
             except Exception as e:
-                print(f"  [error] /event: {e}")
+                print(f"  [error] /event: {e}", flush=True)
                 self._send(400, {"ok": False, "error": str(e)})
 
         elif self.path == "/csv":
@@ -131,7 +130,7 @@ class Handler(BaseHTTPRequestHandler):
             path = os.path.join(OUTPUT_DIR, filename)
             with open(path, "wb") as f:
                 f.write(body)
-            print(f"  [csv] Saved {filename}")
+            print(f"  [csv] Saved {filename}", flush=True)
             self._send(200, {"ok": True})
 
         else:
